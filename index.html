@@ -1,0 +1,171 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    @page { size: A4; margin: 18mm 14mm; }
+    body { margin:0; background:#0f0f10; color:#ece8e3; font-family: Georgia, 'Times New Roman', serif; line-height:1.55; }
+    main { max-width: 900px; margin: 0 auto; }
+    h1 { font-size: 30px; margin: 0 0 8px; color:#f5f1ea; }
+    p, li { font-size: 14.5px; }
+    h2 { font-size: 22px; margin: 26px 0 10px; color:#f1e7d6; font-weight: 700; }
+    code, pre { font-family: 'JetBrains Mono', Consolas, monospace; }
+    pre { background:#1b1b1d; color:#ddd; padding: 14px 16px; border-radius: 10px; white-space: pre-wrap; font-size: 12.5px; }
+    code { background:#222; padding: 2px 6px; border-radius: 6px; color:#e7dfcf; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Coturn Setup Guide</h1>
+  <p>A polished, production-friendly setup guide for configuring Coturn on a VPS.</p>
+
+  <h2>Overview</h2>
+  <p>This document walks through:</p>
+  <ul>
+    <li>Creating a non-root sudo user.</li>
+    <li>Installing Coturn and Certbot.</li>
+    <li>Setting up DNS for <code>turn.codewithkael.com</code>.</li>
+    <li>Issuing a Let’s Encrypt certificate.</li>
+    <li>Configuring <code>/etc/turnserver.conf</code>.</li>
+    <li>Giving Coturn permission to bind port 443.</li>
+    <li>Starting and validating the service.</li>
+    <li>Using the TURN server in a WebRTC app.</li>
+  </ul>
+
+  <h2>Step 0 — SSH in as root</h2>
+  <pre><code class="language-bash">ssh root@YOUR_SERVER_IP
+</code></pre>
+  <p>Use your provider’s normal password or SSH key setup first.</p>
+
+  <h2>Step 1 — Create a non-root user with sudo</h2>
+  <pre><code class="language-bash">adduser kael
+usermod -aG sudo kael
+echo "kael ALL=(ALL) NOPASSWD:ALL" &gt;/etc/sudoers.d/kael
+chmod 440 /etc/sudoers.d/kael
+exit
+ssh kael@YOUR_SERVER_IP
+</code></pre>
+  <p>Replace <code>kael</code> with your preferred username.</p>
+
+  <h2>Step 2 — Install basic packages and Coturn</h2>
+  <pre><code class="language-bash">sudo apt update
+sudo apt install -y coturn certbot
+sudo systemctl stop coturn
+</code></pre>
+
+  <h2>Step 3 — DNS and Cloudflare setup for <code>turn.codewithkael.com</code></h2>
+  <p>In Cloudflare, create an <strong>A</strong> record:</p>
+  <ul>
+    <li>Name: <code>turn</code></li>
+    <li>Type: <code>A</code></li>
+    <li>Value: <code>YOUR_SERVER_IP</code></li>
+    <li>Proxy status: <strong>DNS only</strong> (gray cloud)</li>
+  </ul>
+  <p>Then verify propagation:</p>
+  <pre><code class="language-bash">dig +short turn.codewithkael.com
+</code></pre>
+
+  <h2>Step 4 — Issue a Let’s Encrypt certificate</h2>
+  <pre><code class="language-bash">sudo lsof -i :80 || echo "no process on 80"
+sudo certbot certonly --standalone -d turn.codewithkael.com
+ls -l /etc/letsencrypt/live/turn.codewithkael.com
+</code></pre>
+  <p>You should see <code>fullchain.pem</code> and <code>privkey.pem</code> symlinks.</p>
+
+  <h2>Step 5 — Adjust certificate permissions</h2>
+  <pre><code class="language-bash">sudo chmod 755 /etc/letsencrypt
+sudo chmod 755 /etc/letsencrypt/live
+sudo chmod 755 /etc/letsencrypt/archive
+sudo chmod 644 /etc/letsencrypt/archive/turn.codewithkael.com/privkey1.pem
+</code></pre>
+  <p>If the filename differs, update the <code>privkey*.pem</code> path accordingly.</p>
+
+  <h2>Step 6 — Create <code>/etc/turnserver.conf</code></h2>
+  <pre><code class="language-bash">sudo nano /etc/turnserver.conf
+</code></pre>
+  <p>Use this minimal working configuration (3478 plain, 443 TLS):</p>
+  <pre><code class="language-conf"># Ports
+listening-port=3478
+alt-listening-port=0
+
+tls-listening-port=443
+alt-tls-listening-port=0
+
+# IPs
+listening-ip=YOUR_SERVER_IP
+external-ip=YOUR_SERVER_IP
+
+# Relay ports
+min-port=49152
+max-port=65535
+
+# Auth: static user/pass
+lt-cred-mech
+realm=turn.codewithkael.com
+user=username1:password1
+
+# TLS certs
+cert=/etc/letsencrypt/live/turn.codewithkael.com/fullchain.pem
+pkey=/etc/letsencrypt/live/turn.codewithkael.com/privkey.pem
+
+# Security
+no-rfc5780
+no-stun-backward-compatibility
+response-origin-only-with-rfc5780
+
+# Logging
+syslog
+</code></pre>
+
+  <h2>Step 7 — Ensure Coturn runs with this config</h2>
+  <p>Check the service unit:</p>
+  <pre><code class="language-bash">grep ExecStart /usr/lib/systemd/system/coturn.service 2&gt;/dev/null || \
+  grep ExecStart /lib/systemd/system/coturn.service 2&gt;/dev/null
+</code></pre>
+  <p>If it shows <code>ExecStart=/usr/bin/turnserver -c /etc/turnserver.conf --pidfile=</code>, that’s fine.</p>
+
+  <h2>Step 8 — Allow Coturn to bind port 443</h2>
+  <p>Give the <code>turnserver</code> binary permission to bind privileged ports like 443 while still running as the unprivileged user:</p>
+  <pre><code class="language-bash">sudo setcap 'cap_net_bind_service=+ep' /usr/bin/turnserver
+getcap /usr/bin/turnserver
+</code></pre>
+  <p>Expected output:</p>
+  <pre><code class="language-text">/usr/bin/turnserver = cap_net_bind_service+ep
+</code></pre>
+
+  <h2>Step 9 — Enable and start Coturn</h2>
+  <pre><code class="language-bash">sudo sed -i 's/#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn
+sudo systemctl restart coturn
+sudo systemctl status coturn
+sudo ss -tulpen | grep -E '3478|443'
+</code></pre>
+  <p>You want:</p>
+  <ul>
+    <li>UDP + TCP on <code>3478</code></li>
+    <li>UDP + TCP on <code>443</code> (for TURN over TLS/DTLS)</li>
+  </ul>
+
+  <h2>Step 10 — Use in your WebRTC app</h2>
+  <pre><code class="language-kotlin">iceServers: [
+  { urls: "stun:turn.codewithkael.com:3478" },
+  {
+    urls: [
+      "turn:turn.codewithkael.com:3478?transport=udp",
+      "turn:turn.codewithkael.com:3478?transport=tcp",
+      "turns:turn.codewithkael.com:443?transport=tcp"
+    ],
+    username: "username1",
+    credential: "password1"
+  }
+]
+</code></pre>
+
+  <h2>Notes</h2>
+  <ul>
+    <li>Replace <code>YOUR_SERVER_IP</code> everywhere it appears.</li>
+    <li>Keep the <code>turn</code> DNS record set to <strong>DNS only</strong>.</li>
+    <li>Test connectivity after restarting Coturn.</li>
+  </ul>
+</main>
+</body>
+</html>
